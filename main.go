@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
 	"regexp"
 	"strings"
@@ -18,7 +20,6 @@ import (
 )
 
 func main() {
-	// Подгружаем .env
 	if err := godotenv.Load(); err != nil {
 		log.Println("warning: .env file not found, using system environment")
 	}
@@ -31,16 +32,15 @@ func main() {
 }
 
 func recognizeHandler(w http.ResponseWriter, r *http.Request) {
-	// Разрешаем только POST
 	if r.Method != http.MethodPost {
 		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Ограничение общего тела запроса (пример: 10MB)
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB
+	//=========PARSING_FORM=========//
 
-	// Парсим multipart (в памяти до maxMemory, остальное во временный файл)
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+
 	const maxMemory = 20 << 20
 	if err := r.ParseMultipartForm(maxMemory); err != nil {
 		http.Error(w, "failed parse multipart form: "+err.Error(), http.StatusBadRequest)
@@ -60,7 +60,6 @@ func recognizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Определим MIME (DetectContentType)
 	mimeType := http.DetectContentType(imgBytes)
 	if mimeType == "application/octet-stream" {
 		if t := fh.Header.Get("Content-Type"); t != "" {
@@ -68,11 +67,11 @@ func recognizeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Кодируем в base64 и делаем data URL
+	//=========PROMPT=========//
+
 	b64 := base64.StdEncoding.EncodeToString(imgBytes)
 	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, b64)
 
-	// Формируем строгий промпт, требуем только JSON-ответ
 	promptFile := "prompts/car_identification.txt"
 	promptText, err := loadPrompt(promptFile)
 	if err != nil {
@@ -81,7 +80,6 @@ func recognizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Тело для Responses API
 	bodyObj := map[string]interface{}{
 		"model": "gpt-5-mini",
 		"input": []interface{}{
@@ -93,7 +91,6 @@ func recognizeHandler(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 		},
-		// "temperature": 0.0,
 	}
 
 	jb, err := json.Marshal(bodyObj)
@@ -137,42 +134,66 @@ func recognizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// после чтения respBytes и проверки что resp.StatusCode в 2xx
+	//=========PARSING_RESPONSE=========//
+
 	cleanJSON, err := extractCarJSON(respBytes)
 	if err != nil {
-		// логируем полный ответ для отладки — полезно, когда модель вернула необычную структуру
 		log.Printf("extractCarJSON error: %v; full response: %s", err, string(respBytes))
 		http.Error(w, "failed parse model output: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(cleanJSON)
+	//=========PHOTO=========//
 
+	samplePhotoPath := "car2.jpg"
+
+	photoBytes, err := os.ReadFile(samplePhotoPath)
+	if err != nil {
+		log.Printf("failed to read sample photo: %v", err)
+		http.Error(w, "server error: cannot read sample photo", http.StatusInternalServerError)
+		return
+	}
+
+	//=========MULTIPART=========//
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	photoPartHeader := textproto.MIMEHeader{}
+	photoPartHeader.Set("Content-Disposition", `form-data; name="photo"; filename="sample_photo.jpg"`)
+	photoPartHeader.Set("Content-Type", "image/jpeg")
+	photoPart, _ := writer.CreatePart(photoPartHeader)
+	photoPart.Write(photoBytes)
+
+	jsonPartHeader := textproto.MIMEHeader{}
+	jsonPartHeader.Set("Content-Disposition", `form-data; name="car_info"`)
+	jsonPartHeader.Set("Content-Type", "application/json")
+	jsonPart, _ := writer.CreatePart(jsonPartHeader)
+	jsonPart.Write(cleanJSON)
+
+	writer.Close()
+
+	w.Header().Set("Content-Type", writer.FormDataContentType())
+	w.WriteHeader(http.StatusOK)
+	w.Write(buf.Bytes())
 }
 
-// tries to extract a JSON substring from arbitrary assistant text
 func extractJSONFromText(s string) (string, error) {
 	s = strings.TrimSpace(s)
 
-	// 1) If whole text is valid JSON already — return it
 	var tmp interface{}
 	if json.Unmarshal([]byte(s), &tmp) == nil {
 		return s, nil
 	}
 
-	// 2) strip ```json ``` or ``` fences
 	reFence := regexp.MustCompile("(?s)```(?:json\\s*)?(.*?)```")
 	if m := reFence.FindStringSubmatch(s); len(m) >= 2 {
 		candidate := strings.TrimSpace(m[1])
 		if json.Unmarshal([]byte(candidate), &tmp) == nil {
 			return candidate, nil
 		}
-		// fallthrough and try substring search if fenced content isn't valid JSON
 	}
 
-	// 3) find first '{' or '[' and try to find a matching '}' or ']' by brute force attempts
 	start := strings.IndexAny(s, "{[")
 	if start == -1 {
 		return "", errors.New("no JSON object/array start found in text")
@@ -191,7 +212,6 @@ func extractJSONFromText(s string) (string, error) {
 }
 
 func extractCarJSON(respBytes []byte) ([]byte, error) {
-	// lightweight typed parse to reach content.text quickly
 	var apiResp struct {
 		Output []struct {
 			Content []struct {
@@ -202,12 +222,10 @@ func extractCarJSON(respBytes []byte) ([]byte, error) {
 	}
 
 	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
-		// если структура неожиданная, попробуем обойти через generic поиск "text"
 		var generic map[string]interface{}
 		if err2 := json.Unmarshal(respBytes, &generic); err2 != nil {
 			return nil, fmt.Errorf("failed to parse OpenAI response: %w", err)
 		}
-		// рекурсивный поиск первого поля "text"
 		var found string
 		var walk func(interface{})
 		walk = func(v interface{}) {
@@ -254,7 +272,6 @@ func extractCarJSON(respBytes []byte) ([]byte, error) {
 		return clean, nil
 	}
 
-	// проходимся по всем output -> content в поисках текста
 	var rawText string
 	for _, out := range apiResp.Output {
 		for _, c := range out.Content {
