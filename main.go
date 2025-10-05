@@ -10,9 +10,16 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	// Подгружаем .env
+	if err := godotenv.Load(); err != nil {
+		log.Println("warning: .env file not found, using system environment")
+	}
+
 	http.HandleFunc("/recognize", recognizeHandler)
 
 	addr := ":8080"
