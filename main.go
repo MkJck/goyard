@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -70,18 +73,13 @@ func recognizeHandler(w http.ResponseWriter, r *http.Request) {
 	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, b64)
 
 	// Формируем строгий промпт, требуем только JSON-ответ
-	promptText := `You are an expert automobile identifier. Analyze the attached image and ONLY return a JSON object (no extra commentary) with the fields:
-{
-  "brand": string|null,
-  "modelName": string|null,
-  "generation": string|null,
-  "years": string|null,
-  "priceRange": string|null,
-  "horsepower": number|null,
-  "isElectric": boolean|null,
-  "isHybrid": boolean|null
-}
-If unknown, use null.`
+	promptFile := "prompts/car_identification.txt"
+	promptText, err := loadPrompt(promptFile)
+	if err != nil {
+		log.Printf("failed to load prompt from file: %v", err)
+		http.Error(w, "server error: failed to load prompt", http.StatusInternalServerError)
+		return
+	}
 
 	// Тело для Responses API
 	bodyObj := map[string]interface{}{
@@ -139,8 +137,163 @@ If unknown, use null.`
 		return
 	}
 
-	// Возвращаем ответ OpenAI как есть (JSON). В продакшне лучше распарсить + валидация.
+	// после чтения respBytes и проверки что resp.StatusCode в 2xx
+	cleanJSON, err := extractCarJSON(respBytes)
+	if err != nil {
+		// логируем полный ответ для отладки — полезно, когда модель вернула необычную структуру
+		log.Printf("extractCarJSON error: %v; full response: %s", err, string(respBytes))
+		http.Error(w, "failed parse model output: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(respBytes)
+	w.Write(cleanJSON)
+
+}
+
+// tries to extract a JSON substring from arbitrary assistant text
+func extractJSONFromText(s string) (string, error) {
+	s = strings.TrimSpace(s)
+
+	// 1) If whole text is valid JSON already — return it
+	var tmp interface{}
+	if json.Unmarshal([]byte(s), &tmp) == nil {
+		return s, nil
+	}
+
+	// 2) strip ```json ``` or ``` fences
+	reFence := regexp.MustCompile("(?s)```(?:json\\s*)?(.*?)```")
+	if m := reFence.FindStringSubmatch(s); len(m) >= 2 {
+		candidate := strings.TrimSpace(m[1])
+		if json.Unmarshal([]byte(candidate), &tmp) == nil {
+			return candidate, nil
+		}
+		// fallthrough and try substring search if fenced content isn't valid JSON
+	}
+
+	// 3) find first '{' or '[' and try to find a matching '}' or ']' by brute force attempts
+	start := strings.IndexAny(s, "{[")
+	if start == -1 {
+		return "", errors.New("no JSON object/array start found in text")
+	}
+
+	for end := len(s) - 1; end > start; end-- {
+		if (s[end] == '}' && s[start] == '{') || (s[end] == ']' && s[start] == '[') {
+			cand := strings.TrimSpace(s[start : end+1])
+			if json.Unmarshal([]byte(cand), &tmp) == nil {
+				return cand, nil
+			}
+		}
+	}
+
+	return "", errors.New("couldn't extract valid JSON substring from assistant text")
+}
+
+func extractCarJSON(respBytes []byte) ([]byte, error) {
+	// lightweight typed parse to reach content.text quickly
+	var apiResp struct {
+		Output []struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+
+	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
+		// если структура неожиданная, попробуем обойти через generic поиск "text"
+		var generic map[string]interface{}
+		if err2 := json.Unmarshal(respBytes, &generic); err2 != nil {
+			return nil, fmt.Errorf("failed to parse OpenAI response: %w", err)
+		}
+		// рекурсивный поиск первого поля "text"
+		var found string
+		var walk func(interface{})
+		walk = func(v interface{}) {
+			if found != "" {
+				return
+			}
+			switch vv := v.(type) {
+			case map[string]interface{}:
+				for k, val := range vv {
+					if k == "text" {
+						if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+							found = s
+							return
+						}
+					}
+					walk(val)
+					if found != "" {
+						return
+					}
+				}
+			case []interface{}:
+				for _, item := range vv {
+					walk(item)
+					if found != "" {
+						return
+					}
+				}
+			}
+		}
+		walk(generic)
+		if found == "" {
+			return nil, errors.New("no output text found in response (generic parse)")
+		}
+		rawText := found
+		jsonStr, err := extractJSONFromText(rawText)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract JSON from assistant text: %w", err)
+		}
+		var tmp interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &tmp); err != nil {
+			return nil, fmt.Errorf("assistant text does not contain valid JSON: %w", err)
+		}
+		clean, _ := json.MarshalIndent(tmp, "", "  ")
+		return clean, nil
+	}
+
+	// проходимся по всем output -> content в поисках текста
+	var rawText string
+	for _, out := range apiResp.Output {
+		for _, c := range out.Content {
+			if strings.TrimSpace(c.Text) != "" {
+				rawText = c.Text
+				break
+			}
+		}
+		if rawText != "" {
+			break
+		}
+	}
+
+	if rawText == "" {
+		return nil, errors.New("no output content with text found in response (maybe only reasoning entries present)")
+	}
+
+	jsonStr, err := extractJSONFromText(rawText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract JSON from assistant text: %w", err)
+	}
+
+	var tmp interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &tmp); err != nil {
+		return nil, fmt.Errorf("assistant text does not contain valid JSON: %w", err)
+	}
+
+	clean, err := json.MarshalIndent(tmp, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to reformat JSON: %w", err)
+	}
+
+	return clean, nil
+}
+
+func loadPrompt(filePath string) (string, error) {
+	bytes, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
 }
